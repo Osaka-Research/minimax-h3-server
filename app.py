@@ -1,19 +1,25 @@
 """
-The "remote UI" the Windows pipeline talks to: a prompt-submission page plus
-the job-queue API pipeline.py polls and uploads results to.
+The "remote UI" shared by multiple generation pipelines (Windows video via
+minimax-h3-windows, image via nano-banana-windows, etc): a prompt-submission
+page plus the job-queue API each pipeline polls and uploads results to.
+Jobs carry a `type` (e.g. "video", "image") so each pipeline only claims
+work it can actually do.
 
-Contract (must match pipeline.py / config.json's fetch_prompt_endpoint /
+Contract (must match each pipeline's config.json fetch_prompt_endpoint /
 upload_endpoint exactly):
-  GET  /jobs/next               -> 200 {"job_id": str, "prompt": str}, or 204 if none queued
-  POST /jobs/<job_id>/result    -> multipart field "video", 200 on success
+  GET  /jobs/next?type=<type>   -> 200 {"job_id": str, "prompt": str}, or 204 if none queued
+                                    (type defaults to "video" if omitted, for
+                                    pipelines that predate multi-type support)
+  POST /jobs/<job_id>/result    -> multipart field "video" or "image" (whichever
+                                    matches the job's type), 200 on success
   POST /jobs/<job_id>/fail      -> JSON {"error": str}, 200 on success
 
 Auth: the three pipeline-facing routes above require an `X-API-Key` header
 (API_KEY env var), so other people's pipelines can't steal your job claims.
-The browser routes (/, submitting prompts, viewing videos) are
+The browser routes (/, submitting prompts, viewing results) are
 intentionally open - no login. That means anyone with this URL can queue
-generation jobs your GPU will process; that's a deliberate tradeoff made
-for this deployment, not an oversight.
+generation jobs your machines will process; that's a deliberate tradeoff
+made for this deployment, not an oversight.
 
 Self-healing: a job claimed via /jobs/next but never completed or failed
 (worker crashed, power loss, network partition - anything that skips the
@@ -31,10 +37,15 @@ from flask import Flask, jsonify, redirect, render_template_string, request, sen
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-VIDEOS_DIR = DATA_DIR / "videos"
+MEDIA_DIR = DATA_DIR / "media"
 DB_PATH = DATA_DIR / "jobs.db"
 DATA_DIR.mkdir(exist_ok=True)
-VIDEOS_DIR.mkdir(exist_ok=True)
+MEDIA_DIR.mkdir(exist_ok=True)
+
+VALID_TYPES = {"video", "image"}
+# field name the pipeline uploads its result under, and the extension we
+# store it with, per job type
+RESULT_FIELD_BY_TYPE = {"video": ("video", "mp4"), "image": ("image", "png")}
 
 API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
@@ -62,11 +73,12 @@ def init_db():
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 prompt TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'video',
                 status TEXT NOT NULL DEFAULT 'queued',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 claimed_at TEXT,
                 done_at TEXT,
-                video_filename TEXT,
+                media_filename TEXT,
                 error_message TEXT,
                 claim_count INTEGER NOT NULL DEFAULT 0,
                 claimed_by TEXT
@@ -78,6 +90,16 @@ def init_db():
         existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         if "claimed_by" not in existing_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN claimed_by TEXT")
+        if "type" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN type TEXT NOT NULL DEFAULT 'video'")
+        if "media_filename" not in existing_columns:
+            if "video_filename" in existing_columns:
+                # Older DB from before multi-type support - keep existing
+                # video filenames intact under the new generalized column name.
+                conn.execute("ALTER TABLE jobs ADD COLUMN media_filename TEXT")
+                conn.execute("UPDATE jobs SET media_filename = video_filename")
+            else:
+                conn.execute("ALTER TABLE jobs ADD COLUMN media_filename TEXT")
 
 
 init_db()
@@ -95,29 +117,34 @@ def require_api_key(fn):
 
 PAGE = """
 <!doctype html>
-<title>minimax-h3-windows</title>
+<title>generation queue</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
   textarea { width: 100%; box-sizing: border-box; }
   table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
   td, th { border: 1px solid #ccc; padding: 0.5rem; text-align: left; vertical-align: top; }
-  video { max-width: 240px; }
+  video, img.result { max-width: 240px; }
   .status-failed { color: #b00020; }
   .status-in_progress { color: #9a6700; }
   .status-done { color: #1a7f37; }
   .error { font-size: 0.85em; color: #b00020; }
 </style>
-<h1>MiniMax H3 video generation</h1>
+<h1>Generation queue</h1>
 <form method="post" action="{{ url_for('submit_job') }}">
-  <textarea name="prompt" rows="6" placeholder="Describe the video..." required></textarea><br>
+  <textarea name="prompt" rows="6" placeholder="Describe what to generate..." required></textarea><br>
+  <select name="type">
+    <option value="video">video (MiniMax H3)</option>
+    <option value="image">image (Nano Banana)</option>
+  </select>
   <button type="submit">Generate</button>
 </form>
 <h2>Jobs</h2>
 <table>
-<tr><th>ID</th><th>Prompt</th><th>Status</th><th>Device</th><th>Attempts</th><th>Created</th><th>Result</th></tr>
+<tr><th>ID</th><th>Type</th><th>Prompt</th><th>Status</th><th>Device</th><th>Attempts</th><th>Created</th><th>Result</th></tr>
 {% for job in jobs %}
 <tr>
   <td>{{ job.id[:8] }}</td>
+  <td>{{ job.type }}</td>
   <td>{{ job.prompt[:200] }}
     {% if job.error_message %}<div class="error">{{ job.error_message[:200] }}</div>{% endif %}
   </td>
@@ -125,7 +152,13 @@ PAGE = """
   <td>{{ job.claimed_by or '' }}</td>
   <td>{{ job.claim_count }}</td>
   <td>{{ job.created_at }}</td>
-  <td>{% if job.status == 'done' %}<video src="{{ url_for('get_video', job_id=job.id) }}" controls></video>{% endif %}</td>
+  <td>
+    {% if job.status == 'done' and job.type == 'video' %}
+      <video src="{{ url_for('get_media', job_id=job.id) }}" controls></video>
+    {% elif job.status == 'done' and job.type == 'image' %}
+      <img class="result" src="{{ url_for('get_media', job_id=job.id) }}">
+    {% endif %}
+  </td>
 </tr>
 {% endfor %}
 </table>
@@ -141,12 +174,16 @@ def index():
 
 @app.route("/jobs", methods=["POST"])
 def submit_job():
-    prompt = request.form.get("prompt") or (request.get_json(silent=True) or {}).get("prompt")
+    body = request.get_json(silent=True) or {}
+    prompt = request.form.get("prompt") or body.get("prompt")
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
+    job_type = request.form.get("type") or body.get("type") or "video"
+    if job_type not in VALID_TYPES:
+        return jsonify({"error": f"type must be one of {sorted(VALID_TYPES)}"}), 400
     job_id = uuid.uuid4().hex
     with get_db() as conn:
-        conn.execute("INSERT INTO jobs (id, prompt) VALUES (?, ?)", (job_id, prompt))
+        conn.execute("INSERT INTO jobs (id, prompt, type) VALUES (?, ?, ?)", (job_id, prompt, job_type))
     if request.is_json:
         return jsonify({"job_id": job_id}), 201
     return redirect(url_for("index"))
@@ -164,6 +201,9 @@ def next_job():
     inside the UPDATE's WHERE clause and retrying on the rare row that
     another request claims first (rowcount == 0)."""
     worker_id = request.headers.get("X-Worker-Id", "unknown")
+    job_type = request.args.get("type", "video")
+    if job_type not in VALID_TYPES:
+        return jsonify({"error": f"type must be one of {sorted(VALID_TYPES)}"}), 400
     stale_cutoff = f"-{STALE_CLAIM_TIMEOUT_MINUTES} minutes"
 
     with get_db() as conn:
@@ -185,12 +225,14 @@ def next_job():
             row = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status='queued'
-                   OR (status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count < ?)
+                WHERE type=? AND (
+                    status='queued'
+                    OR (status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count < ?)
+                )
                 ORDER BY CASE WHEN status='queued' THEN 0 ELSE 1 END, created_at
                 LIMIT 1
                 """,
-                (stale_cutoff, MAX_JOB_RETRIES),
+                (job_type, stale_cutoff, MAX_JOB_RETRIES),
             ).fetchone()
             if row is None:
                 return "", 204
@@ -202,12 +244,12 @@ def next_job():
                 """
                 UPDATE jobs SET status='in_progress', claimed_at=datetime('now'),
                        claim_count=claim_count+1, claimed_by=?
-                WHERE id=? AND (
+                WHERE id=? AND type=? AND (
                     status='queued'
                     OR (status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count < ?)
                 )
                 """,
-                (worker_id, row["id"], stale_cutoff, MAX_JOB_RETRIES),
+                (worker_id, row["id"], job_type, stale_cutoff, MAX_JOB_RETRIES),
             )
             if cur.rowcount == 1:
                 return jsonify({"job_id": row["id"], "prompt": row["prompt"]})
@@ -224,15 +266,16 @@ def upload_result(job_id):
         if row is None:
             return jsonify({"error": "unknown job_id"}), 404
 
-    video = request.files.get("video")
-    if video is None:
-        return jsonify({"error": "video file required"}), 400
-    filename = f"{job_id}.mp4"
-    video.save(VIDEOS_DIR / filename)
+    field_name, ext = RESULT_FIELD_BY_TYPE[row["type"]]
+    upload = request.files.get(field_name)
+    if upload is None:
+        return jsonify({"error": f"'{field_name}' file required for type '{row['type']}'"}), 400
+    filename = f"{job_id}.{ext}"
+    upload.save(MEDIA_DIR / filename)
 
     with get_db() as conn:
         conn.execute(
-            "UPDATE jobs SET status='done', done_at=datetime('now'), video_filename=?, error_message=NULL WHERE id=?",
+            "UPDATE jobs SET status='done', done_at=datetime('now'), media_filename=?, error_message=NULL WHERE id=?",
             (filename, job_id),
         )
     return jsonify({"ok": True})
@@ -276,9 +319,13 @@ def job_status(job_id):
     return jsonify(dict(row))
 
 
-@app.route("/videos/<job_id>.mp4")
-def get_video(job_id):
-    return send_from_directory(VIDEOS_DIR, f"{job_id}.mp4")
+@app.route("/media/<job_id>")
+def get_media(job_id):
+    with get_db() as conn:
+        row = conn.execute("SELECT media_filename FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None or row["media_filename"] is None:
+        return jsonify({"error": "no result for this job"}), 404
+    return send_from_directory(MEDIA_DIR, row["media_filename"])
 
 
 @app.route("/healthz")
