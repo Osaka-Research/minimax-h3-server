@@ -1,4 +1,4 @@
-# video-gen server
+# minimax-h3-windows server
 
 The "remote UI" the Windows pipeline (`../pipeline.py`) talks to: a page to
 submit prompts, a job queue, and where the finished videos land.

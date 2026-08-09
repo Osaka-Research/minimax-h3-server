@@ -87,7 +87,7 @@ def require_browser_auth(fn):
     def wrapper(*args, **kwargs):
         auth = request.authorization
         if not auth or auth.password != API_KEY:
-            return Response("Auth required", 401, {"WWW-Authenticate": 'Basic realm="video-gen"'})
+            return Response("Auth required", 401, {"WWW-Authenticate": 'Basic realm="minimax-h3-windows"'})
         return fn(*args, **kwargs)
 
     return wrapper
@@ -95,7 +95,7 @@ def require_browser_auth(fn):
 
 PAGE = """
 <!doctype html>
-<title>video-gen</title>
+<title>minimax-h3-windows</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
   textarea { width: 100%; box-sizing: border-box; }
