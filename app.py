@@ -8,10 +8,12 @@ upload_endpoint exactly):
   POST /jobs/<job_id>/result    -> multipart field "video", 200 on success
   POST /jobs/<job_id>/fail      -> JSON {"error": str}, 200 on success
 
-Auth: a single shared secret (API_KEY env var). Browser routes use HTTP
-Basic (any username, password = API_KEY); the three pipeline-facing routes
-above use an `X-API-Key` header. Without this, anyone who finds the URL
-could queue unlimited GPU jobs or view other people's generated videos.
+Auth: the three pipeline-facing routes above require an `X-API-Key` header
+(API_KEY env var), so other people's pipelines can't steal your job claims.
+The browser routes (/, submitting prompts, viewing videos) are
+intentionally open - no login. That means anyone with this URL can queue
+generation jobs your GPU will process; that's a deliberate tradeoff made
+for this deployment, not an oversight.
 
 Self-healing: a job claimed via /jobs/next but never completed or failed
 (worker crashed, power loss, network partition - anything that skips the
@@ -25,7 +27,7 @@ import uuid
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_from_directory, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, url_for
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -91,17 +93,6 @@ def require_api_key(fn):
     return wrapper
 
 
-def require_browser_auth(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth = request.authorization
-        if not auth or auth.password != API_KEY:
-            return Response("Auth required", 401, {"WWW-Authenticate": 'Basic realm="minimax-h3-windows"'})
-        return fn(*args, **kwargs)
-
-    return wrapper
-
-
 PAGE = """
 <!doctype html>
 <title>minimax-h3-windows</title>
@@ -142,7 +133,6 @@ PAGE = """
 
 
 @app.route("/")
-@require_browser_auth
 def index():
     with get_db() as conn:
         jobs = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50").fetchall()
@@ -150,7 +140,6 @@ def index():
 
 
 @app.route("/jobs", methods=["POST"])
-@require_browser_auth
 def submit_job():
     prompt = request.form.get("prompt") or (request.get_json(silent=True) or {}).get("prompt")
     if not prompt:
@@ -279,7 +268,6 @@ def fail_job(job_id):
 
 
 @app.route("/jobs/<job_id>")
-@require_browser_auth
 def job_status(job_id):
     with get_db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -289,9 +277,18 @@ def job_status(job_id):
 
 
 @app.route("/videos/<job_id>.mp4")
-@require_browser_auth
 def get_video(job_id):
     return send_from_directory(VIDEOS_DIR, f"{job_id}.mp4")
+
+
+@app.route("/healthz")
+def healthz():
+    # Deliberately no auth: Render's own health check hits this to decide
+    # whether to route traffic here at all. If it hit an authenticated route
+    # instead and got a 401, it could plausibly - and wrongly - treat this
+    # instance as not ready, which would explain intermittent "no-server"
+    # responses from Render's edge despite the app never actually crashing.
+    return "ok", 200
 
 
 if __name__ == "__main__":
