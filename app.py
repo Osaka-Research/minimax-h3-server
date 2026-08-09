@@ -45,7 +45,10 @@ app = Flask(__name__)
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # Longer than the 5s default: with several devices polling concurrently
+    # under gunicorn (multiple worker processes), a request may need to wait
+    # for another's write transaction rather than fail outright.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -63,10 +66,16 @@ def init_db():
                 done_at TEXT,
                 video_filename TEXT,
                 error_message TEXT,
-                claim_count INTEGER NOT NULL DEFAULT 0
+                claim_count INTEGER NOT NULL DEFAULT 0,
+                claimed_by TEXT
             )
             """
         )
+        # CREATE TABLE IF NOT EXISTS won't add new columns to an existing DB
+        # file from an older version of this server - migrate it if needed.
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if "claimed_by" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN claimed_by TEXT")
 
 
 init_db()
@@ -114,7 +123,7 @@ PAGE = """
 </form>
 <h2>Jobs</h2>
 <table>
-<tr><th>ID</th><th>Prompt</th><th>Status</th><th>Attempts</th><th>Created</th><th>Result</th></tr>
+<tr><th>ID</th><th>Prompt</th><th>Status</th><th>Device</th><th>Attempts</th><th>Created</th><th>Result</th></tr>
 {% for job in jobs %}
 <tr>
   <td>{{ job.id[:8] }}</td>
@@ -122,6 +131,7 @@ PAGE = """
     {% if job.error_message %}<div class="error">{{ job.error_message[:200] }}</div>{% endif %}
   </td>
   <td class="status-{{ job.status }}">{{ job.status }}</td>
+  <td>{{ job.claimed_by or '' }}</td>
   <td>{{ job.claim_count }}</td>
   <td>{{ job.created_at }}</td>
   <td>{% if job.status == 'done' %}<video src="{{ url_for('get_video', job_id=job.id) }}" controls></video>{% endif %}</td>
@@ -156,7 +166,17 @@ def submit_job():
 @app.route("/jobs/next")
 @require_api_key
 def next_job():
+    """Multiple devices can poll this concurrently - there's no device
+    registration or routing, it's first-request-wins. The claim itself has
+    to be race-safe: a plain SELECT-candidate-then-UPDATE-by-id (the
+    previous approach here) lets two concurrent requests both select the
+    same row before either UPDATE commits, handing the same job to two
+    devices at once. Fixed by re-checking the expected pre-claim state
+    inside the UPDATE's WHERE clause and retrying on the rare row that
+    another request claims first (rowcount == 0)."""
+    worker_id = request.headers.get("X-Worker-Id", "unknown")
     stale_cutoff = f"-{STALE_CLAIM_TIMEOUT_MINUTES} minutes"
+
     with get_db() as conn:
         # Stale claims (worker crashed/unreachable, never reported success or
         # failure) that have also exhausted retries: stop retrying, surface
@@ -170,25 +190,41 @@ def next_job():
             (stale_cutoff, MAX_JOB_RETRIES),
         )
 
-        # Real queued jobs first; stale claims still under the retry cap become
-        # eligible again, so a crashed worker's job gets retried automatically.
-        row = conn.execute(
-            """
-            SELECT * FROM jobs
-            WHERE status='queued'
-               OR (status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count < ?)
-            ORDER BY CASE WHEN status='queued' THEN 0 ELSE 1 END, created_at
-            LIMIT 1
-            """,
-            (stale_cutoff, MAX_JOB_RETRIES),
-        ).fetchone()
-        if row is None:
-            return "", 204
-        conn.execute(
-            "UPDATE jobs SET status='in_progress', claimed_at=datetime('now'), claim_count=claim_count+1 WHERE id=?",
-            (row["id"],),
-        )
-    return jsonify({"job_id": row["id"], "prompt": row["prompt"]})
+        for _ in range(5):
+            # Real queued jobs first; stale claims still under the retry cap
+            # become eligible again, so a crashed worker's job gets retried.
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status='queued'
+                   OR (status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count < ?)
+                ORDER BY CASE WHEN status='queued' THEN 0 ELSE 1 END, created_at
+                LIMIT 1
+                """,
+                (stale_cutoff, MAX_JOB_RETRIES),
+            ).fetchone()
+            if row is None:
+                return "", 204
+
+            # Only succeeds if the row is still in the state we just saw it
+            # in - if another concurrent request already claimed it, this
+            # matches zero rows and we loop to pick a different candidate.
+            cur = conn.execute(
+                """
+                UPDATE jobs SET status='in_progress', claimed_at=datetime('now'),
+                       claim_count=claim_count+1, claimed_by=?
+                WHERE id=? AND (
+                    status='queued'
+                    OR (status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count < ?)
+                )
+                """,
+                (worker_id, row["id"], stale_cutoff, MAX_JOB_RETRIES),
+            )
+            if cur.rowcount == 1:
+                return jsonify({"job_id": row["id"], "prompt": row["prompt"]})
+            # else: lost the race for this row - loop and try the next candidate
+
+    return "", 204
 
 
 @app.route("/jobs/<job_id>/result", methods=["POST"])
