@@ -130,7 +130,7 @@ PAGE = """
   <td>{{ job.id[:8] }}</td>
   <td>{{ job.type }}</td>
   <td>{{ job.prompt[:200] }}
-    {% if job.error_message %}<div class="error">{{ job.error_message[:200] }}</div>{% endif %}
+    {% if job.error_message %}<div class="error" title="{{ job.error_message }}">{% if job.error_message|length > 300 %}…{% endif %}{{ job.error_message[-300:] }}</div>{% endif %}
   </td>
   <td class="status-{{ job.status }}">{{ job.status }}</td>
   <td>{{ job.claimed_by or '' }}</td>
