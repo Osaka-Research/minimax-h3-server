@@ -14,12 +14,11 @@ upload_endpoint exactly):
                                     matches the job's type), 200 on success
   POST /jobs/<job_id>/fail      -> JSON {"error": str}, 200 on success
 
-Auth: the three pipeline-facing routes above require an `X-API-Key` header
-(API_KEY env var), so other people's pipelines can't steal your job claims.
-The browser routes (/, submitting prompts, viewing results) are
-intentionally open - no login. That means anyone with this URL can queue
-generation jobs your machines will process; that's a deliberate tradeoff
-made for this deployment, not an oversight.
+Auth: none. Every route, including the pipeline-facing ones, is open to
+anyone with this URL - that means anyone who has it can queue generation
+jobs your machines will process, or claim/complete jobs as if they were
+your own pipeline. Deliberate tradeoff for this deployment, not an
+oversight.
 
 Self-healing: a job claimed via /jobs/next but never completed or failed
 (worker crashed, power loss, network partition - anything that skips the
@@ -30,7 +29,6 @@ STALE_CLAIM_TIMEOUT_MINUTES, so it gets retried without manual intervention.
 import os
 import sqlite3
 import uuid
-from functools import wraps
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, url_for
@@ -46,10 +44,6 @@ VALID_TYPES = {"video", "image"}
 # field name the pipeline uploads its result under, and the extension we
 # store it with, per job type
 RESULT_FIELD_BY_TYPE = {"video": ("video", "mp4"), "image": ("image", "png")}
-
-API_KEY = os.environ.get("API_KEY")
-if not API_KEY:
-    raise SystemExit("Set the API_KEY environment variable before starting the server (see server/README.md).")
 
 STALE_CLAIM_TIMEOUT_MINUTES = int(os.environ.get("STALE_CLAIM_TIMEOUT_MINUTES", "30"))
 MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "3"))
@@ -103,16 +97,6 @@ def init_db():
 
 
 init_db()
-
-
-def require_api_key(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if request.headers.get("X-API-Key") != API_KEY:
-            return jsonify({"error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
-
-    return wrapper
 
 
 PAGE = """
@@ -190,7 +174,6 @@ def submit_job():
 
 
 @app.route("/jobs/next")
-@require_api_key
 def next_job():
     """Multiple devices can poll this concurrently - there's no device
     registration or routing, it's first-request-wins. The claim itself has
@@ -259,7 +242,6 @@ def next_job():
 
 
 @app.route("/jobs/<job_id>/result", methods=["POST"])
-@require_api_key
 def upload_result(job_id):
     with get_db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -282,7 +264,6 @@ def upload_result(job_id):
 
 
 @app.route("/jobs/<job_id>/fail", methods=["POST"])
-@require_api_key
 def fail_job(job_id):
     """Called by the pipeline when a job errors out (bad prompt, ComfyUI OOM,
     transient network error, etc.). Re-queued for another automatic attempt

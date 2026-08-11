@@ -10,7 +10,7 @@ poll it for work and upload results back.
 
 - `GET /` — web page: pick a type (video/image), submit a prompt, see
   queued/in-progress/done jobs, view finished results inline. No login —
-  see Auth below.
+  see Auth below (applies to every route, not just this one).
 - `GET /jobs/next?type=video|image` — polled by a pipeline; returns the
   oldest queued job of that type and marks it claimed, or 204 if none.
   `type` defaults to `video` if omitted, for pipelines that predate
@@ -33,33 +33,27 @@ commit.
 
 ## Auth
 
-The three pipeline-facing routes (`/jobs/next`, `/jobs/<id>/result`,
-`/jobs/<id>/fail`) require the shared secret in the `API_KEY` env var, sent
-as an `X-API-Key` header — this stops other people's pipelines from
-stealing your job claims.
-
-The browser routes (`/`, submitting prompts, `/jobs/<id>`, `/media/<id>`)
-are **intentionally open, no login**. That's a deliberate tradeoff, not an
-oversight: anyone with this URL can queue generation jobs your machines
-will process. If that's not acceptable for your deployment, add auth back
-in front of it (e.g. a reverse proxy with Basic Auth) — it was removed
-here on request.
+None. Every route, including the pipeline-facing ones (`/jobs/next`,
+`/jobs/<id>/result`, `/jobs/<id>/fail`), is open to anyone with this URL.
+That means anyone who has it can queue generation jobs your machines will
+process, or claim/complete jobs as if they were your own pipeline. Deliberate
+tradeoff, not an oversight — if that's not acceptable for your deployment,
+add auth back in front of it (e.g. a reverse proxy with Basic Auth).
 
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
-API_KEY=$(openssl rand -hex 20) python app.py   # prints nothing - pick your own and remember it
+python app.py
 ```
 
-Or set a specific key: `API_KEY=your-secret-here python app.py`. Listens on
-`0.0.0.0:8000` (override with `PORT`).
+Listens on `0.0.0.0:8000` (override with `PORT`).
 
 For anything beyond local testing, run it behind a real WSGI server instead
 of Flask's dev server:
 
 ```bash
-API_KEY=your-secret-here gunicorn -w 2 -b 0.0.0.0:8000 app:app
+gunicorn -w 2 -b 0.0.0.0:8000 app:app
 ```
 
 Optional tuning env vars: `MAX_JOB_RETRIES` (default 3),
@@ -71,8 +65,8 @@ crashed without reporting failure).
 This needs to be reachable from wherever a pipeline runs - options include
 a small VPS, a platform like Render/Railway/Fly.io, or a tunnel
 (ngrok/Cloudflare Tunnel) to a machine on your own network. Any of these
-work the same way: set `API_KEY`, run the app (ideally via gunicorn), and
-get a public HTTPS URL. Also set a health check path of `/healthz` if the
+work the same way: run the app (ideally via gunicorn) and get a public
+HTTPS URL. Also set a health check path of `/healthz` if the
 platform supports one and hits `/` by default - `/` is fine to load in a
 browser but a health checker expecting a plain 2xx on `/` can behave
 oddly depending on what's rendered there, `/healthz` is always a bare 200.
@@ -81,8 +75,7 @@ Once you have that URL, on each pipeline machine's `config.json`:
 
 ```jsonc
 {
-  "remote_ui_base_url": "https://your-deployed-url.example",
-  "remote_api_key": "the-same-API_KEY-value"
+  "remote_ui_base_url": "https://your-deployed-url.example"
 }
 ```
 
