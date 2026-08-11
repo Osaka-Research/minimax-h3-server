@@ -149,9 +149,28 @@ PAGE = """
 """
 
 
+def sweep_stale_claims(conn):
+    """Fails in_progress jobs whose claim went stale (worker crashed/hung/
+    unreachable) and has exhausted retries. Must be called from more than
+    just next_job() - if the single worker for a type hangs mid-job without
+    ever hitting its own timeout or calling /fail, it stops polling
+    next_job() entirely, so a sweep that only runs there would never fire
+    for its own stuck claim."""
+    stale_cutoff = f"-{STALE_CLAIM_TIMEOUT_MINUTES} minutes"
+    conn.execute(
+        """
+        UPDATE jobs SET status='failed', done_at=datetime('now'),
+               error_message=COALESCE(error_message, 'worker crashed or unreachable, retries exhausted')
+        WHERE status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count >= ?
+        """,
+        (stale_cutoff, MAX_JOB_RETRIES),
+    )
+
+
 @app.route("/")
 def index():
     with get_db() as conn:
+        sweep_stale_claims(conn)
         jobs = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50").fetchall()
     return render_template_string(PAGE, jobs=jobs)
 
@@ -190,17 +209,7 @@ def next_job():
     stale_cutoff = f"-{STALE_CLAIM_TIMEOUT_MINUTES} minutes"
 
     with get_db() as conn:
-        # Stale claims (worker crashed/unreachable, never reported success or
-        # failure) that have also exhausted retries: stop retrying, surface
-        # as failed instead of stuck "in_progress" forever.
-        conn.execute(
-            """
-            UPDATE jobs SET status='failed', done_at=datetime('now'),
-                   error_message=COALESCE(error_message, 'worker crashed or unreachable, retries exhausted')
-            WHERE status='in_progress' AND claimed_at < datetime('now', ?) AND claim_count >= ?
-            """,
-            (stale_cutoff, MAX_JOB_RETRIES),
-        )
+        sweep_stale_claims(conn)
 
         for _ in range(5):
             # Real queued jobs first; stale claims still under the retry cap
